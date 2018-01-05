@@ -3,7 +3,8 @@ import * as fs from 'fs';
 import SlackIntegration from './SlackIntegration';
 import LineIntegration from './LineIntegration';
 import { SlackConfig, LineConfig } from '../types';
-import { mkdir, getConfigRoot } from '../util';
+import { getConfigRoot } from '../configUtil';
+import * as mkdirp from 'mkdirp';
 import * as _ from 'lodash';
 
 process.on('SIGINT', () => {
@@ -11,7 +12,7 @@ process.on('SIGINT', () => {
 });
 
 const logdir = './logs';
-mkdir(logdir);
+mkdirp.sync(logdir);
 
 const configRoot = getConfigRoot();
 const slackConfig = _.get(configRoot, 'logging.slack');
@@ -34,7 +35,7 @@ addIntegration(SlackIntegration, slackConfig);
 addIntegration(LineIntegration, lineConfig);
 
 function addIntegration(
-  Integration: { new(config: any): SlackIntegration | LineIntegration },
+  Integration: { new (config: any): SlackIntegration | LineIntegration },
   config: SlackConfig | LineConfig | undefined
 ): void {
   if (config && config.enabled) {

@@ -1,7 +1,7 @@
 // tslint:disable:variable-name
 import { Castable, cast, element } from '@bitr/castable';
 
-export interface Order {
+export interface BrokerOrder {
   order_type: string;
   product_id: string;
   side: string;
@@ -12,7 +12,7 @@ export interface Order {
 }
 
 export interface SendOrderRequest {
-  order: Order;
+  order: BrokerOrder;
 }
 
 export class SendOrderResponse extends Castable {
@@ -81,7 +81,9 @@ export class OrdersResponse extends Castable {
   @cast settings?: any;
   @cast trailing_stop_type: boolean;
   @cast trailing_stop_value: boolean;
-  @cast @element(Execution) executions: Execution[];
+  @cast
+  @element(Execution)
+  executions: Execution[];
   @cast stop_triggered_time?: any;
 }
 
@@ -110,8 +112,12 @@ export class TradingAccount extends Castable {
 
 export type TradingAccountsResponse = TradingAccount[];
 export class PriceLevelsResponse extends Castable {
-  @cast @element(Array, Number) buy_price_levels: number[][];
-  @cast @element(Array, Number) sell_price_levels: number[][];
+  @cast
+  @element(Array, Number)
+  buy_price_levels: number[][];
+  @cast
+  @element(Array, Number)
+  sell_price_levels: number[][];
 }
 
 export type CloseAllResponse = ClosingTrade[];
@@ -139,4 +145,15 @@ export class ClosingTrade extends Castable {
   @cast created_at: number;
   @cast updated_at: number;
   @cast total_interest: number;
+}
+
+export class AccountBalance extends Castable {
+  @cast currency: string;
+  @cast balance: number;
+}
+
+export type AccountBalanceResponse = AccountBalance[];
+
+export interface CashMarginTypeStrategy {
+  getBtcPosition(): Promise<number>;
 }

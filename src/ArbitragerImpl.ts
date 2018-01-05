@@ -1,7 +1,7 @@
 ﻿import { getLogger } from './logger';
 import { injectable, inject } from 'inversify';
 import * as _ from 'lodash';
-import Order from './Order';
+import OrderImpl from './OrderImpl';
 import {
   BrokerAdapterRouter,
   ConfigStore,
@@ -14,32 +14,37 @@ import {
   QuoteSide,
   OrderSide,
   LimitCheckerFactory,
-  OrderPair,
-  ReverseOption,
-  ProceedOption,
-  OnSingleLegConfig
+  ActivePairStore,
+  Quote,
+  OrderPair
 } from './types';
 import t from './intl';
-import { padEnd, hr, delay, calculateCommission, findBrokerConfig } from './util';
-import Quote from './Quote';
+import { padEnd, hr, delay } from './util';
 import symbols from './symbols';
 import { fatalErrors } from './constants';
+import SingleLegHandler from './SingleLegHandler';
+import { findBrokerConfig } from './configUtil';
 
 @injectable()
 export default class ArbitragerImpl implements Arbitrager {
   private readonly log = getLogger(this.constructor.name);
-  private activePairs: OrderPair[] = [];
   private lastSpreadAnalysisResult: SpreadAnalysisResult;
   private shouldStop: boolean = false;
+  private readonly singleLegHandler: SingleLegHandler;
 
+  // TODO: avoid constructor over-injection
   constructor(
     @inject(symbols.QuoteAggregator) private readonly quoteAggregator: QuoteAggregator,
     @inject(symbols.ConfigStore) private readonly configStore: ConfigStore,
     @inject(symbols.PositionService) private readonly positionService: PositionService,
     @inject(symbols.BrokerAdapterRouter) private readonly brokerAdapterRouter: BrokerAdapterRouter,
     @inject(symbols.SpreadAnalyzer) private readonly spreadAnalyzer: SpreadAnalyzer,
-    @inject(symbols.LimitCheckerFactory) private readonly limitCheckerFactory: LimitCheckerFactory
-  ) {} 
+    @inject(symbols.LimitCheckerFactory) private readonly limitCheckerFactory: LimitCheckerFactory,
+    @inject(symbols.ActivePairStore) private readonly activePairStore: ActivePairStore
+  ) {
+    const onSingleLegConfig = configStore.config.onSingleLeg;
+    this.singleLegHandler = new SingleLegHandler(this.brokerAdapterRouter, onSingleLegConfig);
+  }
 
   status: string = 'Init';
 
@@ -77,9 +82,9 @@ export default class ArbitragerImpl implements Arbitrager {
     this.log.info(t`LookingForOpportunity`);
     const { config } = this.configStore;
 
-    const exitFlag = await this.findClosable(quotes);
+    const closableOrdersKey = await this.findClosable(quotes);
     let spreadAnalysisResult: SpreadAnalysisResult;
-    if (exitFlag) {
+    if (closableOrdersKey) {
       spreadAnalysisResult = this.lastSpreadAnalysisResult;
     } else {
       try {
@@ -92,28 +97,29 @@ export default class ArbitragerImpl implements Arbitrager {
       }
     }
 
-    if (!exitFlag) {
+    if (!closableOrdersKey) {
       this.printSpreadAnalysisResult(spreadAnalysisResult);
     }
 
-    const limitChecker = this.limitCheckerFactory.create(spreadAnalysisResult, exitFlag);
+    const limitChecker = this.limitCheckerFactory.create(spreadAnalysisResult, closableOrdersKey);
     const limitCheckResult = limitChecker.check();
     if (!limitCheckResult.success) {
       this.status = limitCheckResult.reason;
       return;
     }
 
-    if (exitFlag) {
+    if (closableOrdersKey) {
       this.log.info(t`FoundClosableOrders`);
+      await this.activePairStore.del(closableOrdersKey);
     } else {
       this.log.info(t`FoundArbitrageOppotunity`);
     }
     try {
       const { bestBid, bestAsk, targetVolume } = spreadAnalysisResult;
       const sendTasks = [bestAsk, bestBid].map(q => this.sendOrder(q, targetVolume, OrderType.Limit));
-      const orders = (await Promise.all(sendTasks)) as OrderPair;
+      const orders = await Promise.all(sendTasks);
       this.status = 'Sent';
-      await this.checkOrderState(orders, exitFlag);
+      await this.checkOrderState(orders, closableOrdersKey);
     } catch (ex) {
       this.log.error(ex.message);
       this.log.debug(ex.stack);
@@ -127,7 +133,7 @@ export default class ArbitragerImpl implements Arbitrager {
     await delay(config.sleepAfterSend);
   }
 
-  private async checkOrderState(orders: OrderPair, exitFlag: boolean): Promise<void> {
+  private async checkOrderState(orders: OrderImpl[], closableOrdersKey: string): Promise<void> {
     const { config } = this.configStore;
     for (const i of _.range(1, config.maxRetryCount + 1)) {
       await delay(config.orderStatusCheckInterval);
@@ -144,21 +150,16 @@ export default class ArbitragerImpl implements Arbitrager {
       this.printOrderSummary(orders);
 
       if (orders.every(o => o.filled)) {
-        if (exitFlag) {
+        this.log.info(t`BothLegsAreSuccessfullyFilled`);
+        if (closableOrdersKey) {
           this.status = 'Closed';
         } else {
           this.status = 'Filled';
-          this.activePairs.push(orders);
+          if (orders[0].size === orders[1].size) {
+            await this.activePairStore.put(orders as OrderPair);
+          }
         }
-        const commission = _(orders).sumBy(o => this.calculateFilledOrderCommission(o));
-        const profit = _.round(
-          _(orders).sumBy(o => (o.side === OrderSide.Sell ? 1 : -1) * o.filledNotional) - commission
-        );
-        this.log.info(t`BothLegsAreSuccessfullyFilled`);
-        this.log.info(t`ProfitIs`, profit);
-        if (commission !== 0) {
-          this.log.info(t`CommissionIs`, _.round(commission));
-        }
+        this.printProfit(orders);
         break;
       }
 
@@ -167,27 +168,38 @@ export default class ArbitragerImpl implements Arbitrager {
         this.log.warn(t`MaxRetryCountReachedCancellingThePendingOrders`);
         const cancelTasks = orders.filter(o => !o.filled).map(o => this.brokerAdapterRouter.cancel(o));
         await Promise.all(cancelTasks);
-        if (orders.filter(o => o.filled).length === 1) {
-          const onSingleLegConfig = config.onSingleLeg;
-          await this.handleSingleLeg(orders, onSingleLegConfig, exitFlag);
+        if (
+          orders.some(o => !o.filled) &&
+          _(orders).sumBy(o => o.filledSize * (o.side === OrderSide.Buy ? -1 : 1)) !== 0
+        ) {
+          const subOrders = await this.singleLegHandler.handle(orders as OrderPair, closableOrdersKey);
+          if (subOrders.length !== 0 && subOrders.every(o => o.filled)) {
+            this.printProfit(_.concat(orders, subOrders));
+          }
         }
         break;
       }
     }
   }
 
-  private calculateFilledOrderCommission(order: Order): number {
-    const brokerConfig = findBrokerConfig(this.configStore.config, order.broker);
-    return calculateCommission(order.averageFilledPrice, order.filledSize, brokerConfig.commissionPercent);
+  private calcProfit(orders: OrderImpl[], commission: number) {
+    return _(orders).sumBy(o => (o.side === OrderSide.Sell ? 1 : -1) * o.filledNotional) - commission;
   }
 
-  private async findClosable(quotes: Quote[]): Promise<boolean> {
+  private calcCommissionFromConfig(order: OrderImpl): number {
+    const brokerConfig = findBrokerConfig(this.configStore.config, order.broker);
+    return OrderImpl.calculateCommission(order.averageFilledPrice, order.filledSize, brokerConfig.commissionPercent);
+  }
+
+  private async findClosable(quotes: Quote[]): Promise<string> {
     const { minExitTargetProfit, minExitTargetProfitPercent } = this.configStore.config;
     if (minExitTargetProfit === undefined && minExitTargetProfitPercent === undefined) {
-      return false;
+      return "";
     }
-    this.printActivePairs();
-    for (const pair of this.activePairs.slice().reverse()) {
+    const activePairsMap = await this.activePairStore.getAll();
+    this.printActivePairs(activePairsMap.map(kv => kv.value));
+    for (const { key, value } of activePairsMap.slice().reverse()) {
+      const pair = value;
       try {
         this.log.debug(`Analyzing pair: ${pair}...`);
         const result = await this.spreadAnalyzer.analyze(quotes, this.positionService.positionMap, pair);
@@ -202,23 +214,22 @@ export default class ArbitragerImpl implements Arbitrager {
         ]) as number;
         this.log.debug(`effectiveMinExitTargetProfit: ${effectiveMinExitTargetProfit}`);
         if (targetProfit >= effectiveMinExitTargetProfit) {
-          this.activePairs = _.without(this.activePairs, pair);
           this.lastSpreadAnalysisResult = result;
-          return true;
+          return key;
         }
       } catch (ex) {
         this.log.debug(ex.message);
       }
     }
-    return false;
+    return "";
   }
 
-  private async sendOrder(quote: Quote, targetVolume: number, orderType: OrderType): Promise<Order> {
+  private async sendOrder(quote: Quote, targetVolume: number, orderType: OrderType): Promise<OrderImpl> {
     this.log.info(t`SendingOrderTargettingQuote`, quote);
     const brokerConfig = findBrokerConfig(this.configStore.config, quote.broker);
     const { cashMarginType, leverageLevel } = brokerConfig;
     const orderSide = quote.side === QuoteSide.Ask ? OrderSide.Buy : OrderSide.Sell;
-    const order = new Order(
+    const order = new OrderImpl(
       quote.broker,
       orderSide,
       targetVolume,
@@ -231,79 +242,7 @@ export default class ArbitragerImpl implements Arbitrager {
     return order;
   }
 
-  private async handleSingleLeg(orders: OrderPair, onSingleLegConfig: OnSingleLegConfig, exitFlag: Boolean) {
-    if (onSingleLegConfig === undefined) {
-      return;
-    }
-    const action = exitFlag ? onSingleLegConfig.actionOnExit : onSingleLegConfig.action;
-    if (action === undefined || action === 'Cancel') {
-      return;
-    }
-    const { options } = onSingleLegConfig;
-    switch (action) {
-      case 'Reverse':
-        await this.reverseLeg(orders, options as ReverseOption);
-        return;
-      case 'Proceed':
-        await this.proceedLeg(orders, options as ProceedOption);
-        return;
-      default:
-        throw new Error('Invalid action.');
-    }
-  }
-
-  private async reverseLeg(orders: OrderPair, options: ReverseOption) {
-    const filledLeg = orders.filter(o => o.filled)[0];
-    const sign = filledLeg.side === OrderSide.Buy ? -1 : 1;
-    const price = _.round(filledLeg.price * (1 + sign * options.limitMovePercent / 100));
-    this.log.info(t`ReverseFilledLeg`, filledLeg.toShortString(), price.toLocaleString());
-    const reversalOrder = new Order(
-      filledLeg.broker,
-      filledLeg.side === OrderSide.Buy ? OrderSide.Sell : OrderSide.Buy,
-      filledLeg.size,
-      price,
-      filledLeg.cashMarginType,
-      OrderType.Limit,
-      filledLeg.leverageLevel
-    );
-    await this.sendOrderWithTtl(reversalOrder, options.ttl);
-  }
-
-  private async proceedLeg(orders: OrderPair, options: ProceedOption) {
-    const unfilledLeg = orders.filter(o => !o.filled)[0];
-    const sign = unfilledLeg.side === OrderSide.Buy ? 1 : -1;
-    const price = _.round(unfilledLeg.price * (1 + sign * options.limitMovePercent / 100));
-    this.log.info(t`ExecuteUnfilledLeg`, unfilledLeg.toShortString(), price.toLocaleString());
-    const revisedOrder = new Order(
-      unfilledLeg.broker,
-      unfilledLeg.side,
-      unfilledLeg.size,
-      price,
-      unfilledLeg.cashMarginType,
-      OrderType.Limit,
-      unfilledLeg.leverageLevel
-    );
-    await this.sendOrderWithTtl(revisedOrder, options.ttl);
-  }
-
-  private async sendOrderWithTtl(order: Order, ttl: number) {
-    try {
-      this.log.info(t`SendingOrderTtl`, ttl);
-      await this.brokerAdapterRouter.send(order);
-      await delay(ttl);
-      await this.brokerAdapterRouter.refresh(order);
-      if (order.filled) {
-        this.log.info(`${order.toExecSummary()}`);
-      } else {
-        this.log.info(t`NotFilledTtl`, ttl);
-        await this.brokerAdapterRouter.cancel(order);
-      }
-    } catch (ex) {
-      this.log.warn(ex.message);
-    }
-  }
-
-  private printOrderSummary(orders: Order[]) {
+  private printOrderSummary(orders: OrderImpl[]) {
     orders.forEach(o => {
       if (o.filled) {
         this.log.info(o.toExecSummary());
@@ -328,13 +267,22 @@ export default class ArbitragerImpl implements Arbitrager {
     );
   }
 
-  private printActivePairs(): void {
-    if (this.activePairs.length === 0) {
+  private printActivePairs(activePairs: OrderPair[]): void {
+    if (activePairs.length === 0) {
       return;
     }
     this.log.info(t`OpenPairs`);
-    this.activePairs.forEach(pair => {
+    activePairs.forEach(pair => {
       this.log.info(`[${pair[0].toShortString()}, ${pair[1].toShortString()}]`);
     });
+  }
+
+  private printProfit(orders: OrderImpl[]): void {
+    const commission = _(orders).sumBy(o => this.calcCommissionFromConfig(o));
+    const profit = this.calcProfit(orders, commission);
+    this.log.info(t`ProfitIs`, _.round(profit));
+    if (commission !== 0) {
+      this.log.info(t`CommissionIs`, _.round(commission));
+    }
   }
 } /* istanbul ignore next */

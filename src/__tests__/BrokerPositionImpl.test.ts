@@ -1,12 +1,11 @@
-import BrokerPosition from '../BrokerPosition';
-import { Broker } from '../types';
+import BrokerPositionImpl from '../BrokerPositionImpl';
 import { options } from '../logger';
 options.enabled = false;
 
 describe('BrokerPosition', () => {
   test('toString format', () => {
-    const target = new BrokerPosition();
-    target.broker = Broker.Coincheck;
+    const target = new BrokerPositionImpl();
+    target.broker = 'Coincheck';
     target.btc = 0.01;
     target.allowedLongSize = 0.05;
     target.allowedShortSize = 0;

@@ -2,7 +2,7 @@ import { CashMarginType, OrderSide, OrderType, OrderStatus, Broker } from '../..
 import MarginOpenStrategy from '../../Coincheck/MarginOpenStrategy';
 import nocksetup from './nocksetup';
 import BrokerApi from '../../Coincheck/BrokerApi';
-import Order from '../../Order';
+import OrderImpl from '../../OrderImpl';
 import * as nock from 'nock';
 import { options } from '../../logger';
 options.enabled = false;
@@ -12,8 +12,8 @@ nocksetup();
 describe('MarginOpenStrategy', () => {
   test('send leverage buy limit', async () => {
     const strategy = new MarginOpenStrategy(new BrokerApi('', ''));
-    const order = new Order(
-      Broker.Coincheck,
+    const order = new OrderImpl(
+      'Coincheck',
       OrderSide.Buy,
       0.005,
       300000,
@@ -25,8 +25,8 @@ describe('MarginOpenStrategy', () => {
 
   test('send fails - not MarginOpen order', async () => {
     const strategy = new MarginOpenStrategy(new BrokerApi('', ''));
-    const order = new Order(
-      Broker.Coincheck,
+    const order = new OrderImpl(
+      'Coincheck',
       OrderSide.Buy,
       0.005,
       300000,
@@ -41,8 +41,8 @@ describe('MarginOpenStrategy', () => {
 
   test('send fails', async () => {
     const strategy = new MarginOpenStrategy(new BrokerApi('', ''));
-    const order = new Order(
-      Broker.Coincheck,
+    const order = new OrderImpl(
+      'Coincheck',
       OrderSide.Buy,
       0.005,
       300000,

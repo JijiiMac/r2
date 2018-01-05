@@ -1,8 +1,8 @@
-﻿import { ConfigRoot, ConfigValidator, BrokerConfig, Broker, CashMarginType } from './types';
+﻿import { ConfigRoot, ConfigValidator, BrokerConfig, CashMarginType } from './types';
 import t from './intl';
 import * as _ from 'lodash';
 import { injectable } from 'inversify';
-import { findBrokerConfig } from './util';
+import { findBrokerConfig } from './configUtil';
 
 @injectable()
 export default class ConfigValidatorImpl implements ConfigValidator {
@@ -20,25 +20,29 @@ export default class ConfigValidatorImpl implements ConfigValidator {
     this.mustBePositive(config.priceMergeSize, 'priceMergeSize');
     this.mustBePositive(config.sleepAfterSend, 'sleepAfterSend');
 
-    const bitflyer = findBrokerConfig(config, Broker.Bitflyer);
+    const bitflyer = findBrokerConfig(config, 'Bitflyer');
     if (this.isEnabled(bitflyer)) {
-      this.throwIf(bitflyer.cashMarginType !== CashMarginType.Cash,
-        'CashMarginType must be Cash for Bitflyer.');
+      this.throwIf(bitflyer.cashMarginType !== CashMarginType.Cash, 'CashMarginType must be Cash for Bitflyer.');
       this.validateBrokerConfigCommon(bitflyer);
     }
 
-    const coincheck = findBrokerConfig(config, Broker.Coincheck);
+    const coincheck = findBrokerConfig(config, 'Coincheck');
     if (this.isEnabled(coincheck)) {
       const allowedCashMarginType = [CashMarginType.Cash, CashMarginType.MarginOpen, CashMarginType.NetOut];
-      this.throwIf(!_.includes(allowedCashMarginType, coincheck.cashMarginType),
-        'CashMarginType must be Cash or MarginOpen for Coincheck.');
+      this.throwIf(
+        !_.includes(allowedCashMarginType, coincheck.cashMarginType),
+        'CashMarginType must be Cash, NetOut or MarginOpen for Coincheck.'
+      );
       this.validateBrokerConfigCommon(coincheck);
     }
 
-    const quoine = findBrokerConfig(config, Broker.Quoine);
+    const quoine = findBrokerConfig(config, 'Quoine');
     if (this.isEnabled(quoine)) {
-      this.throwIf(quoine.cashMarginType !== CashMarginType.NetOut,
-        'CashMarginType must be NetOut for Quoine.');
+      const allowedCashMarginType = [CashMarginType.Cash, CashMarginType.NetOut];
+      this.throwIf(
+        !_.includes(allowedCashMarginType, quoine.cashMarginType),
+        'CashMarginType must be Cash or NetOut for Quoine.'
+      );
       this.validateBrokerConfigCommon(quoine);
     }
   }
